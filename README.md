@@ -1,3 +1,5 @@
+I made this for personal use, I mainly used it with snipping tool screenshots from Cat Fantasy gatcha game to find skill/character icons for my wikipedia fan project. 
+
 # IMG Finder Tool
 This repository includes a startup BAT script that:
 - Uses the local `.venv` virtual environment if available
