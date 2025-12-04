@@ -1,6 +1,7 @@
 I made this for personal use, I mainly used it with snipping tool screenshots from Cat Fantasy gatcha game to find skill/character icons for my wikipedia fan project. 
 
 # IMG Finder Tool
+<img width="1919" height="1028" alt="image" src="https://github.com/user-attachments/assets/2b5c48e3-93c1-4393-a279-64d6b089a5bf" />
 
 A PyQt6-based image similarity finder that uses deep learning embeddings and multiple similarity metrics to find duplicate or visually similar images.
 
