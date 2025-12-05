@@ -21,7 +21,7 @@ from PyQt6 import QtWidgets, QtGui, QtCore
 from layout_manager import SimpleLayoutManager
 
 CONFIG_NAME = "imgfinder_config.json"
-MAX_TABS = 11
+MAX_TABS = 10
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 # ---- defaults for settings ----
@@ -222,6 +222,8 @@ class ResultsTab(QtWidgets.QWidget):
 
 
 class ImageTab(QtWidgets.QWidget):
+    modeChanged = QtCore.pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -245,13 +247,32 @@ class ImageTab(QtWidgets.QWidget):
         info_icon.setToolTip(
             "Paste screenshot or image (CTRL+V)\n"
             "Drag & drop images onto tabs.\n"
-            "Or use 'Load Image into Current Tab...'"
+            "Or use 'Load Image into Current Tab...'\n\n"
+            "- Right-click a tab to rename it.\n"
+            "- Use the B&W button to toggle black & white matching for that tab."
         )
         # place the icon at the top-right of the tab area
         info_row = QtWidgets.QHBoxLayout()
         info_row.addStretch(1)
         info_row.addWidget(info_icon)
         layout.addLayout(info_row)
+
+        # content row: left side for B&W toggle button, right side for preview
+        content_row = QtWidgets.QHBoxLayout()
+        content_row.setSpacing(12)
+
+        # B&W toggle button (placed left of preview)
+        self.bw_button = QtWidgets.QPushButton("B&W")
+        self.bw_button.setCheckable(True)
+        self.bw_button.setFixedSize(80, 36)
+        self.bw_button.setStyleSheet(
+            "QPushButton { background-color: #2b2d31; color: #ffffff; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #43b581; }"
+        )
+        self.bw_button.setToolTip("Toggle black & white matching for this tab")
+        self.bw_button.toggled.connect(self._on_bw_toggled)
+
+        content_row.addWidget(self.bw_button, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
 
         self.preview_frame = QtWidgets.QFrame()
         self.preview_frame.setStyleSheet("background-color: #2b2d31; border-radius: 6px;")
@@ -270,7 +291,9 @@ class ImageTab(QtWidgets.QWidget):
         self.preview_label.setStyleSheet("color: #777777;")
         pf_layout.addWidget(self.preview_label)
 
-        layout.addWidget(self.preview_frame, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+        # add preview into content row, then add the content row to main layout
+        content_row.addWidget(self.preview_frame, stretch=1)
+        layout.addLayout(content_row)
         layout.addStretch(1)
 
     def set_query_image(self, img: Image.Image):
@@ -278,6 +301,18 @@ class ImageTab(QtWidgets.QWidget):
         disp = img.copy()
         disp.thumbnail((280, 280))
         self.preview_label.setPixmap(pil_to_qpixmap(disp))
+
+    def _on_bw_toggled(self, checked: bool):
+        self.is_bw = bool(checked)
+        self.modeChanged.emit()
+
+    def set_bw_mode(self, enabled: bool):
+        self.is_bw = bool(enabled)
+        try:
+            self.bw_button.blockSignals(True)
+            self.bw_button.setChecked(self.is_bw)
+        finally:
+            self.bw_button.blockSignals(False)
 
 
 # ---------------------- PASTE TAB WIDGET (DRAG & DROP) ----------------------
@@ -775,11 +810,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paste_tabs.filesDropped.connect(self.on_files_dropped_into_paste_tabs)
         for i in range(MAX_TABS):
             tab = ImageTab()
-            # tab 11 (index 10) is a special black & white matcher
-            if i == 10:
-                self.paste_tabs.addTab(tab, "B&W")
-            else:
-                self.paste_tabs.addTab(tab, f"Tab {i+1}")
+            self.paste_tabs.addTab(tab, f"Tab {i+1}")
+            # when a tab toggles its BW mode, persist config
+            tab.modeChanged.connect(self.save_config)
+        # enable right-click rename on the tab bar
+        tb = self.paste_tabs.tabBar()
+        tb.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        tb.customContextMenuRequested.connect(self.on_tabbar_context_menu)
         left_layout.addWidget(self.paste_tabs)
         self.hsplit.addWidget(left_widget)
 
@@ -812,10 +849,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(MAX_TABS):
             rt = ResultsTab()
             rt.set_layout_settings(self.results_columns, self.results_font_size, self.results_thumb_size)
-            if i == 10:
-                self.results_tabs.addTab(rt, "B&W")
-            else:
-                self.results_tabs.addTab(rt, f"Results {i+1}")
+            self.results_tabs.addTab(rt, f"Results {i+1}")
         bottom_layout.addWidget(self.results_tabs, stretch=1)
 
         # --- USE SimpleLayoutManager FOR TOP/BOTTOM SPLIT ---
@@ -1152,6 +1186,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.split_bottom_height = int(data.get("split_bottom_height", 450))
         self.split_left_width = int(data.get("split_left_width", 600))
         self.hsplit_sizes = data.get("hsplit_sizes")
+        # per-tab settings
+        self.tab_names = data.get("tab_names", [])
+        self.tab_bw = data.get("tab_bw", [])
 
     def save_config(self):
         data = {
@@ -1179,6 +1216,18 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self.hsplit is not None:
                 data["hsplit_sizes"] = self.hsplit.sizes()
+        except Exception:
+            pass
+        # save per-tab names and bw modes
+        try:
+            names = []
+            bw = []
+            for i in range(self.paste_tabs.count()):
+                names.append(self.paste_tabs.tabText(i))
+                tab = self.paste_tabs.widget(i)
+                bw.append(bool(getattr(tab, "is_bw", False)))
+            data["tab_names"] = names
+            data["tab_bw"] = bw
         except Exception:
             pass
 
@@ -1227,6 +1276,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.hsplit.setSizes(self.hsplit_sizes)
             # Apply layout manager sizes from config
             self.layout_manager.set_sizes(self.split_top_height, self.split_bottom_height)
+        except Exception:
+            pass
+
+    def on_tabbar_context_menu(self, pos):
+        tab_bar = self.paste_tabs.tabBar()
+        idx = tab_bar.tabAt(pos)
+        if idx < 0:
+            return
+        menu = QtWidgets.QMenu()
+        act_rename = menu.addAction("Rename Tab")
+        action = menu.exec(tab_bar.mapToGlobal(pos))
+        if action == act_rename:
+            cur_name = self.paste_tabs.tabText(idx)
+            text, ok = QtWidgets.QInputDialog.getText(self, "Rename Tab", "New tab name:", text=cur_name)
+            if ok and text:
+                self.paste_tabs.setTabText(idx, text)
+                # keep results tab label consistent (user can override in settings if desired)
+                self.results_tabs.setTabText(idx, f"Results {idx+1}")
+                self.save_config()
+        # apply saved tab names and bw modes if present
+        try:
+            # tab_names and tab_bw may be shorter or longer than actual tab count
+            for i in range(self.paste_tabs.count()):
+                if hasattr(self, "tab_names") and i < len(self.tab_names):
+                    name = self.tab_names[i] or f"Tab {i+1}"
+                    self.paste_tabs.setTabText(i, name)
+                    self.results_tabs.setTabText(i, f"Results {i+1}" if not name.startswith("Results") else name)
+                if hasattr(self, "tab_bw") and i < len(self.tab_bw):
+                    tab: ImageTab = self.paste_tabs.widget(i)
+                    tab.set_bw_mode(bool(self.tab_bw[i]))
         except Exception:
             pass
 
@@ -1323,8 +1402,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (0 <= tab_index < self.paste_tabs.count()):
             return
         tab: ImageTab = self.paste_tabs.widget(tab_index)
-        # mark B&W special tab
-        tab.is_bw = (tab_index == 10)
         tab.set_query_image(img)
 
         pil = img.convert("RGB")
