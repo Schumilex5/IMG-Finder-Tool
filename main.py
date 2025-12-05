@@ -48,6 +48,13 @@ def pil_to_qpixmap(pil_img: Image.Image) -> QtGui.QPixmap:
     return QtGui.QPixmap.fromImage(qimg)
 
 
+def suppress_qt_warnings(type, context, message):
+    """Suppress noisy Qt warnings like QFont::setPointSize."""
+    if "QFont::setPointSize" in message or "setPointSize" in message:
+        return
+    print(f"{context.category}: {message}")
+
+
 # ---------------------- RESULTS TAB ----------------------
 
 
@@ -167,19 +174,16 @@ class ResultsTab(QtWidgets.QWidget):
         return handler
 
     def move_selected(self, output_folder: str):
+        """Move all selected paths from this tab. Silent operation (no popups)."""
         if not self.selected_paths:
-            QtWidgets.QMessageBox.critical(self, "Error", "No results selected in this results tab.")
             return
 
         os.makedirs(output_folder, exist_ok=True)
 
         remaining_results: list[tuple[float, str]] = []
-        moved_count = 0
-        errors = []
 
         for src in list(self.selected_paths):
             if not os.path.isfile(src):
-                errors.append(f"File not found: {src}")
                 self.selected_paths.discard(src)
                 continue
 
@@ -192,10 +196,9 @@ class ResultsTab(QtWidgets.QWidget):
                 counter += 1
             try:
                 shutil.move(src, dest)
-                moved_count += 1
                 self.selected_paths.discard(src)
-            except Exception as e:
-                errors.append(f"Failed to move {src}: {e}")
+            except Exception:
+                pass
 
         for score, path in self.results:
             if path not in self.selected_paths and os.path.exists(path):
@@ -203,19 +206,6 @@ class ResultsTab(QtWidgets.QWidget):
 
         self.results = remaining_results
         self.display_results()
-
-        if errors:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Move Completed With Errors",
-                "Moved {} files.\nErrors:\n{}".format(moved_count, "\n".join(errors)),
-            )
-        else:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Move Completed",
-                f"Moved {moved_count} files.",
-            )
 
 
 # ---------------------- IMAGE TAB (INPUT) ----------------------
@@ -1605,12 +1595,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.output_folder_path:
             QtWidgets.QMessageBox.critical(self, "Error", "Output folder is not set.")
             return
-        rt: ResultsTab = self.results_tabs.currentWidget()
-        rt.move_selected(self.output_folder_path)
+        # collect selected paths from all tabs
+        all_selected = []
+        for i in range(self.results_tabs.count()):
+            rt: ResultsTab = self.results_tabs.widget(i)
+            all_selected.extend(list(rt.selected_paths))
+        
+        if not all_selected:
+            return
+        
+        os.makedirs(self.output_folder_path, exist_ok=True)
+        
+        # move all selected files from all tabs
+        for src in all_selected:
+            if not os.path.isfile(src):
+                continue
+            filename = os.path.basename(src)
+            base, ext = os.path.splitext(filename)
+            dest = os.path.join(self.output_folder_path, filename)
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(self.output_folder_path, f"{base}_moved{counter}{ext}")
+                counter += 1
+            try:
+                shutil.move(src, dest)
+            except Exception:
+                pass
+        
+        # refresh all result tabs
+        for i in range(self.results_tabs.count()):
+            rt: ResultsTab = self.results_tabs.widget(i)
+            rt.selected_paths.clear()
+            rt.results = [(score, path) for score, path in rt.results if os.path.exists(path)]
+            rt.display_results()
 
 
 def main():
     app = QtWidgets.QApplication([])
+    # suppress noisy Qt font warnings
+    QtCore.qInstallMessageHandler(suppress_qt_warnings)
     win = MainWindow()
     win.show()
     app.exec()
