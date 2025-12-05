@@ -21,7 +21,7 @@ from PyQt6 import QtWidgets, QtGui, QtCore
 from layout_manager import SimpleLayoutManager
 
 CONFIG_NAME = "imgfinder_config.json"
-MAX_TABS = 10
+MAX_TABS = 11
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 # ---- defaults for settings ----
@@ -229,19 +229,29 @@ class ImageTab(QtWidgets.QWidget):
         self.query_phash = None
         self.query_embed = None
         self.query_gray = None
+        self.is_bw = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        self.info_label = QtWidgets.QLabel(
+        # compact info "i" - tooltip on hover shows instructions
+        info_icon = QtWidgets.QLabel("i")
+        info_icon.setFixedSize(22, 22)
+        info_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        info_icon.setStyleSheet(
+            "background-color: #1e1f22; color: #ffffff; border-radius: 11px; font-weight: bold;"
+        )
+        info_icon.setToolTip(
             "Paste screenshot or image (CTRL+V)\n"
             "Drag & drop images onto tabs.\n"
             "Or use 'Load Image into Current Tab...'"
         )
-        self.info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.info_label.setStyleSheet("color: #ffffff; font-size: 14px;")
-        layout.addWidget(self.info_label)
+        # place the icon at the top-right of the tab area
+        info_row = QtWidgets.QHBoxLayout()
+        info_row.addStretch(1)
+        info_row.addWidget(info_icon)
+        layout.addLayout(info_row)
 
         self.preview_frame = QtWidgets.QFrame()
         self.preview_frame.setStyleSheet("background-color: #2b2d31; border-radius: 6px;")
@@ -468,6 +478,9 @@ class MatchWorker(QtCore.QObject):
             q_embed = qinfo["embed"]
             q_gray = qinfo["gray"]
 
+            # support special mode for black & white tab
+            mode = qinfo.get("mode", "default")
+
             ph_dists = np.array([q_hash - h for h in asset_hashes], dtype=np.float32)
             ph_sim = 1.0 - (ph_dists / 64.0)
             ph_sim = np.clip(ph_sim, 0.0, 1.0)
@@ -478,6 +491,38 @@ class MatchWorker(QtCore.QObject):
             cos = np.clip(cos, -1.0, 1.0)
             cos_norm = (cos + 1.0) / 2.0
 
+            # adjust weights when matching black & white imagery
+            if mode == "bw":
+                # favor structural similarity and pHash for B&W
+                adj_cos = self.weight_cos * 0.20
+                adj_ph = self.weight_phash * 1.10
+                adj_ss = self.weight_ssim * 2.0
+
+                sum_final_adj = adj_cos + adj_ph + adj_ss
+                if sum_final_adj <= 0:
+                    w_cos_f = 0.0
+                    w_ph_f = 0.5
+                    w_ss_f = 0.5
+                else:
+                    w_cos_f = adj_cos / sum_final_adj
+                    w_ph_f = adj_ph / sum_final_adj
+                    w_ss_f = adj_ss / sum_final_adj
+
+                sum_base_adj = adj_cos + adj_ph
+                if sum_base_adj <= 0:
+                    w_cos_b = 0.3
+                    w_ph_b = 0.7
+                else:
+                    w_cos_b = adj_cos / sum_base_adj
+                    w_ph_b = adj_ph / sum_base_adj
+            else:
+                # use global-normalized weights computed earlier
+                w_cos_f = w_cos_f
+                w_ph_f = w_ph_f
+                w_ss_f = w_ss_f
+                w_cos_b = w_cos_b
+                w_ph_b = w_ph_b
+
             base_score = w_cos_b * cos_norm + w_ph_b * ph_sim
             idx_sorted = np.argsort(base_score)[::-1][:cand_count]
 
@@ -486,7 +531,13 @@ class MatchWorker(QtCore.QObject):
                 self.throttle()
                 g = asset_grays[i]
                 try:
-                    s_ssim = ssim(q_gray, g, data_range=255)
+                    # if in B&W mode, compare binarized versions to emphasize shape/contrast
+                    if mode == "bw":
+                        _, q_bin = cv2.threshold(q_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                        _, g_bin = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                        s_ssim = ssim(q_bin, g_bin, data_range=255)
+                    else:
+                        s_ssim = ssim(q_gray, g, data_range=255)
                 except Exception:
                     s_ssim = 0.0
                 s_ssim = float(np.clip(s_ssim, 0.0, 1.0))
@@ -724,7 +775,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paste_tabs.filesDropped.connect(self.on_files_dropped_into_paste_tabs)
         for i in range(MAX_TABS):
             tab = ImageTab()
-            self.paste_tabs.addTab(tab, f"Tab {i+1}")
+            # tab 11 (index 10) is a special black & white matcher
+            if i == 10:
+                self.paste_tabs.addTab(tab, "B&W")
+            else:
+                self.paste_tabs.addTab(tab, f"Tab {i+1}")
         left_layout.addWidget(self.paste_tabs)
         self.hsplit.addWidget(left_widget)
 
@@ -757,7 +812,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(MAX_TABS):
             rt = ResultsTab()
             rt.set_layout_settings(self.results_columns, self.results_font_size, self.results_thumb_size)
-            self.results_tabs.addTab(rt, f"Results {i+1}")
+            if i == 10:
+                self.results_tabs.addTab(rt, "B&W")
+            else:
+                self.results_tabs.addTab(rt, f"Results {i+1}")
         bottom_layout.addWidget(self.results_tabs, stretch=1)
 
         # --- USE SimpleLayoutManager FOR TOP/BOTTOM SPLIT ---
@@ -1265,6 +1323,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (0 <= tab_index < self.paste_tabs.count()):
             return
         tab: ImageTab = self.paste_tabs.widget(tab_index)
+        # mark B&W special tab
+        tab.is_bw = (tab_index == 10)
         tab.set_query_image(img)
 
         pil = img.convert("RGB")
@@ -1380,6 +1440,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "phash": tab.query_phash,
                         "embed": tab.query_embed,
                         "gray": tab.query_gray,
+                        "mode": "bw" if getattr(tab, "is_bw", False) else "default",
                     }
                 )
 
