@@ -251,7 +251,11 @@ class ImageTab(QtWidgets.QWidget):
         content_row = QtWidgets.QHBoxLayout()
         content_row.setSpacing(12)
 
-        # B&W toggle button (placed left of preview)
+        # Left-side buttons layout
+        left_buttons = QtWidgets.QVBoxLayout()
+        left_buttons.setSpacing(6)
+
+        # B&W toggle button
         self.bw_button = QtWidgets.QPushButton("B&W")
         self.bw_button.setCheckable(True)
         self.bw_button.setFixedSize(80, 36)
@@ -261,8 +265,21 @@ class ImageTab(QtWidgets.QWidget):
         )
         self.bw_button.setToolTip("Toggle black & white matching for this tab")
         self.bw_button.toggled.connect(self._on_bw_toggled)
+        left_buttons.addWidget(self.bw_button)
 
-        content_row.addWidget(self.bw_button, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
+        # Clear button
+        self.clear_button = QtWidgets.QPushButton("Clear")
+        self.clear_button.setFixedSize(80, 36)
+        self.clear_button.setStyleSheet(
+            "QPushButton { background-color: #2b2d31; color: #ffffff; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #3a3d42; }"
+        )
+        self.clear_button.setToolTip("Clear pasted image from this tab")
+        self.clear_button.clicked.connect(self._on_clear_clicked)
+        left_buttons.addWidget(self.clear_button)
+
+        left_buttons.addStretch(1)
+        content_row.addLayout(left_buttons)
 
         self.preview_frame = QtWidgets.QFrame()
         self.preview_frame.setStyleSheet("background-color: #2b2d31; border-radius: 6px;")
@@ -294,6 +311,15 @@ class ImageTab(QtWidgets.QWidget):
 
     def _on_bw_toggled(self, checked: bool):
         self.is_bw = bool(checked)
+        self.modeChanged.emit()
+
+    def _on_clear_clicked(self):
+        self.query_image_pil = None
+        self.query_phash = None
+        self.query_embed = None
+        self.query_gray = None
+        self.preview_label.setPixmap(QtGui.QPixmap())
+        self.preview_label.setText("No image")
         self.modeChanged.emit()
 
     def set_bw_mode(self, enabled: bool):
