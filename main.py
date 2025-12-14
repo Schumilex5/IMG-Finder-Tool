@@ -14,6 +14,7 @@ from torchvision import transforms
 
 import imagehash
 from skimage.metrics import structural_similarity as ssim
+from skimage.morphology import skeletonize
 import psutil
 
 from PyQt6 import QtWidgets, QtGui, QtCore
@@ -34,9 +35,13 @@ DEFAULT_COLUMNS = 5
 DEFAULT_W_COS = 0.55
 DEFAULT_W_PHASH = 0.25
 DEFAULT_W_SSIM = 0.20
+DEFAULT_W_SHAPE = 0.85
 DEFAULT_BOOST_DIST = 6
 DEFAULT_BOOST_VAL = 0.15
 DEFAULT_CAND_LIMIT = 80
+DEFAULT_LINE_ART_COV = 0.12
+DEFAULT_LINE_ART_EDGE = 0.02
+DEFAULT_PREFILTER_IOU = 0.08
 
 
 def pil_to_qpixmap(pil_img: Image.Image) -> QtGui.QPixmap:
@@ -46,6 +51,179 @@ def pil_to_qpixmap(pil_img: Image.Image) -> QtGui.QPixmap:
     w, h = pil_img.size
     qimg = QtGui.QImage(data, w, h, QtGui.QImage.Format.Format_RGBA8888)
     return QtGui.QPixmap.fromImage(qimg)
+
+
+def compute_mask_and_hu_from_pil(pil: Image.Image):
+    """
+    Robust silhouette extraction for both transparent PNG assets and plain screenshots.
+
+    Returns:
+        mask_small (128x128 uint8 0/255) or None,
+        hu_log (7,) float32 or None,
+        is_line_art (bool)
+    """
+    try:
+        p = pil.convert("RGBA")
+        arr = np.array(p)
+        h, w = arr.shape[:2]
+
+        # ---------------------------
+        # 1) Prefer REAL alpha masks
+        # ---------------------------
+        mask = None
+        alpha = arr[:, :, 3]
+        if int(alpha.min()) < 250:  # meaningful transparency exists
+            mask = ((alpha > 0).astype(np.uint8) * 255)
+
+        # -----------------------------------------
+        # 2) Otsu threshold variants (screenshot-safe)
+        # -----------------------------------------
+        if mask is None:
+            rgb = arr[:, :, :3]
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            _, mask_inv = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+            _, mask_bin = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+            def coverage(m):
+                return float(m.sum() / (255.0 * m.size))
+
+            cand = []
+            for mm in (mask_inv, mask_bin):
+                cov = coverage(mm)
+                if 0.01 < cov < 0.95:
+                    cand.append((cov, mm))
+            chosen = cand[0][1] if cand else None
+
+            if chosen is not None:
+                # fill large external contours
+                cnts, _ = cv2.findContours(chosen.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                filled = np.zeros_like(chosen)
+                area_thresh = max(32, int(0.0025 * filled.size))
+                for c in cnts:
+                    if cv2.contourArea(c) > area_thresh:
+                        cv2.drawContours(filled, [c], -1, 255, thickness=cv2.FILLED)
+                # light cleanup
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, k, iterations=2)
+                mask = filled if 0.01 < coverage(filled) < 0.95 else None
+
+        # -----------------------------------------
+        # 3) GrabCut fallback (best for screenshots)
+        # -----------------------------------------
+        if mask is None:
+            try:
+                bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+                gc_mask = np.zeros((h, w), np.uint8)  # GC_BGD by default
+                bgdModel = np.zeros((1, 65), np.float64)
+                fgdModel = np.zeros((1, 65), np.float64)
+
+                m = max(2, int(min(h, w) * 0.05))  # 5% inset
+                rect = (m, m, max(1, w - 2 * m), max(1, h - 2 * m))
+                cv2.grabCut(bgr, gc_mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+                fg = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+                cov = float(fg.sum() / (255.0 * fg.size))
+                if 0.01 < cov < 0.95:
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k, iterations=1)
+                    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k, iterations=2)
+                    mask = fg
+            except Exception:
+                mask = None
+
+        # --------------------------------------------------------
+        # 4) Background-from-border color distance fallback (last)
+        # --------------------------------------------------------
+        if mask is None:
+            rgb = arr[:, :, :3].astype(np.float32)
+
+            # sample border pixels and use a robust "dominant" bg color
+            border = np.concatenate([rgb[0, :, :], rgb[-1, :, :], rgb[:, 0, :], rgb[:, -1, :]], axis=0)
+            bg = np.median(border, axis=0)
+
+            dist = np.linalg.norm(rgb - bg, axis=2)
+            dmax = float(dist.max() + 1e-6)
+            dist_n = dist / dmax
+
+            # pick threshold relative to border distribution (prevents "all-foreground")
+            border_dist = np.linalg.norm(border - bg, axis=1) / dmax
+            thr = float(np.percentile(border_dist, 95) + 0.05)  # + margin
+            thr = min(max(thr, 0.08), 0.35)
+
+            mask = (dist_n > thr).astype(np.uint8) * 255
+
+        # ---------------------------
+        # 5) Postprocess to isolate subject
+        #   - remove background connected to border
+        #   - keep largest component
+        # ---------------------------
+        if mask is None:
+            return None, None, False
+
+        mask_bin = (mask > 0).astype(np.uint8)
+
+        # floodfill background on inverted mask (areas that are background and connected to border)
+        inv = (1 - mask_bin).astype(np.uint8)  # 1 where background
+        ff = inv.copy()
+        flood = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(ff, flood, (0, 0), 2)
+        # anything marked '2' is border-connected background
+        border_bg = (ff == 2).astype(np.uint8)
+        fg = (1 - border_bg).astype(np.uint8)
+
+        # keep largest connected component (avoid grabbing whole card rectangle)
+        num, labels = cv2.connectedComponents(fg)
+        if num > 1:
+            areas = [(lab, int((labels == lab).sum())) for lab in range(1, num)]
+            lab_max = max(areas, key=lambda x: x[1])[0]
+            fg = (labels == lab_max).astype(np.uint8)
+
+        mask = (fg * 255).astype(np.uint8)
+
+        # resize to 128x128 for downstream
+        mask_small = cv2.resize(mask, (128, 128), interpolation=cv2.INTER_AREA)
+
+        # Hu moments
+        hu_log = None
+        try:
+            moments = cv2.moments(mask_small)
+            hu = cv2.HuMoments(moments).flatten()
+            hu_log = np.array([-np.sign(hh) * np.log10(abs(hh) + 1e-30) for hh in hu], dtype=np.float32)
+        except Exception:
+            hu_log = None
+
+        # simple line-art heuristic (edge-heavy + low fill)
+        try:
+            gray_full = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+            edges_full = cv2.Canny(gray_full, 50, 150)
+            filled_cov = float(mask_small.sum() / (255.0 * mask_small.size))
+            edge_cov = float((edges_full > 0).sum() / edges_full.size)
+            is_line_art = (filled_cov < DEFAULT_LINE_ART_COV and edge_cov > DEFAULT_LINE_ART_EDGE)
+        except Exception:
+            is_line_art = False
+
+        # If line-art, skeletonize edges for a thinner shape signal
+        if is_line_art:
+            try:
+                edges = cv2.Canny(gray_full, 50, 150)
+                sk = skeletonize((edges > 0))
+                sk_uint = (sk.astype(np.uint8) * 255)
+                mask_small = cv2.resize(sk_uint, (128, 128), interpolation=cv2.INTER_AREA)
+                try:
+                    moments = cv2.moments(mask_small)
+                    hu = cv2.HuMoments(moments).flatten()
+                    hu_log = np.array([-np.sign(hh) * np.log10(abs(hh) + 1e-30) for hh in hu], dtype=np.float32)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return mask_small, hu_log, bool(is_line_art)
+
+    except Exception:
+        return None, None, False
 
 
 def suppress_qt_warnings(type, context, message):
@@ -213,6 +391,7 @@ class ResultsTab(QtWidgets.QWidget):
 
 class ImageTab(QtWidgets.QWidget):
     modeChanged = QtCore.pyqtSignal()
+    debugRequested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -221,7 +400,11 @@ class ImageTab(QtWidgets.QWidget):
         self.query_phash = None
         self.query_embed = None
         self.query_gray = None
+        self.query_mask = None
+        self.query_hu = None
+        self.query_is_line = False
         self.is_bw = False
+        self.is_shape = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -239,7 +422,8 @@ class ImageTab(QtWidgets.QWidget):
             "Drag & drop images onto tabs.\n"
             "Or use 'Load Image into Current Tab...'\n\n"
             "- Right-click a tab to rename it.\n"
-            "- Use the B&W button to toggle black & white matching for that tab."
+            "- Use the B&W button to toggle black & white matching for that tab.\n"
+            "- Use the Shape button to match black-lined shapes to transparent-background images."
         )
         # place the icon at the top-right of the tab area
         info_row = QtWidgets.QHBoxLayout()
@@ -256,6 +440,18 @@ class ImageTab(QtWidgets.QWidget):
         left_buttons.setSpacing(6)
 
         # B&W toggle button
+        # SHAPE toggle button
+        self.shape_button = QtWidgets.QPushButton("Shape")
+        self.shape_button.setCheckable(True)
+        self.shape_button.setFixedSize(80, 36)
+        self.shape_button.setStyleSheet(
+            "QPushButton { background-color: #2b2d31; color: #ffffff; border-radius: 6px; }"
+            "QPushButton:checked { background-color: #f47b23; }"
+        )
+        self.shape_button.setToolTip("Toggle shape matching mode (match black-lined shapes to transparent-bg images)")
+        self.shape_button.toggled.connect(self._on_shape_toggled)
+        left_buttons.addWidget(self.shape_button)
+
         self.bw_button = QtWidgets.QPushButton("B&W")
         self.bw_button.setCheckable(True)
         self.bw_button.setFixedSize(80, 36)
@@ -277,6 +473,17 @@ class ImageTab(QtWidgets.QWidget):
         self.clear_button.setToolTip("Clear pasted image from this tab")
         self.clear_button.clicked.connect(self._on_clear_clicked)
         left_buttons.addWidget(self.clear_button)
+
+        # Debug button (show shapes/edges/contours for query/current results)
+        self.debug_button = QtWidgets.QPushButton("DBG")
+        self.debug_button.setFixedSize(80, 36)
+        self.debug_button.setStyleSheet(
+            "QPushButton { background-color: #2b2d31; color: #ffffff; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #3a3d42; }"
+        )
+        self.debug_button.setToolTip("Show mask/edges/contours comparison for this tab (requires results)")
+        self.debug_button.clicked.connect(lambda: self.debugRequested.emit())
+        left_buttons.addWidget(self.debug_button)
 
         left_buttons.addStretch(1)
         content_row.addLayout(left_buttons)
@@ -311,6 +518,14 @@ class ImageTab(QtWidgets.QWidget):
 
     def _on_bw_toggled(self, checked: bool):
         self.is_bw = bool(checked)
+        # when B&W is on, disable shape mode to avoid conflicts
+        if self.is_bw and getattr(self, "is_shape", False):
+            self.is_shape = False
+            try:
+                self.shape_button.blockSignals(True)
+                self.shape_button.setChecked(False)
+            finally:
+                self.shape_button.blockSignals(False)
         self.modeChanged.emit()
 
     def _on_clear_clicked(self):
@@ -318,17 +533,46 @@ class ImageTab(QtWidgets.QWidget):
         self.query_phash = None
         self.query_embed = None
         self.query_gray = None
+        self.query_mask = None
         self.preview_label.setPixmap(QtGui.QPixmap())
         self.preview_label.setText("No image")
         self.modeChanged.emit()
 
     def set_bw_mode(self, enabled: bool):
         self.is_bw = bool(enabled)
+        if self.is_bw and getattr(self, "is_shape", False):
+            # when enabling BW, ensure shape mode is disabled
+            self.is_shape = False
+            try:
+                self.shape_button.blockSignals(True)
+                self.shape_button.setChecked(False)
+            finally:
+                self.shape_button.blockSignals(False)
         try:
             self.bw_button.blockSignals(True)
             self.bw_button.setChecked(self.is_bw)
         finally:
             self.bw_button.blockSignals(False)
+
+    def _on_shape_toggled(self, checked: bool):
+        # when shape mode is toggled on, disable B&W mode; maintain mutual exclusivity
+        self.is_shape = bool(checked)
+        if self.is_shape and self.is_bw:
+            self.is_bw = False
+            try:
+                self.bw_button.blockSignals(True)
+                self.bw_button.setChecked(False)
+            finally:
+                self.bw_button.blockSignals(False)
+        self.modeChanged.emit()
+
+    def set_shape_mode(self, enabled: bool):
+        self.is_shape = bool(enabled)
+        try:
+            self.shape_button.blockSignals(True)
+            self.shape_button.setChecked(self.is_shape)
+        finally:
+            self.shape_button.blockSignals(False)
 
 
 # ---------------------- PASTE TAB WIDGET (DRAG & DROP) ----------------------
@@ -392,9 +636,13 @@ class MatchWorker(QtCore.QObject):
         weight_cos,
         weight_phash,
         weight_ssim,
+        weight_shape,
+        shape_method,
         boost_distance,
         boost_value,
         candidate_limit,
+        shape_only=False,
+        shape_auto_method=True,
     ):
         super().__init__()
         self.tabs_info = tabs_info
@@ -409,9 +657,13 @@ class MatchWorker(QtCore.QObject):
         self.weight_cos = weight_cos
         self.weight_phash = weight_phash
         self.weight_ssim = weight_ssim
+        self.weight_shape = weight_shape
+        self.shape_method = shape_method
         self.boost_distance = boost_distance
         self.boost_value = boost_value
         self.candidate_limit = candidate_limit
+        self.shape_only = bool(shape_only)
+        self.shape_auto_method = bool(shape_auto_method)
 
         self.proc = psutil.Process(os.getpid())
         self._last_check = time.time()
@@ -470,28 +722,63 @@ class MatchWorker(QtCore.QObject):
         asset_hashes = [None] * total_images
         asset_grays = [None] * total_images
         asset_pils = [None] * total_images
+        asset_masks = [None] * total_images
+        asset_hus = [None] * total_images
+        asset_is_line = [False] * total_images
 
         def prep_worker(idx, path):
             try:
                 pil = Image.open(path).convert("RGB")
             except Exception:
-                return idx, None, None, None
+                return idx, None, None, None, None, None, False
             try:
                 h = imagehash.phash(pil)
             except Exception:
                 h = imagehash.ImageHash(np.zeros((8, 8), dtype=bool))
+            # compute a mask from alpha if present (transparent background), else threshold non-white color
+            try:
+                mask_small, hu_log, is_line = compute_mask_and_hu_from_pil(Image.open(path))
+                mask = mask_small
+            except Exception:
+                mask = None
             gray = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2GRAY)
             gray_small = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
-            return idx, h, gray_small, pil
+            # 'mask' variable may be a small mask already from compute_mask_and_hu
+            hu_log = None
+            mask_small = None
+            try:
+                if mask is not None:
+                    # if mask is full-size, ensure we resize; if already 128 it's fine
+                    if isinstance(mask, np.ndarray) and mask.shape[0:2] != (128, 128):
+                        mask_small = cv2.resize(mask, (128, 128), interpolation=cv2.INTER_AREA)
+                    else:
+                        mask_small = mask
+            except Exception:
+                mask_small = None
+            try:
+                # compute hu only if not already returned
+                if hu_log is None and mask_small is not None:
+                    moments = cv2.moments(mask_small)
+                    hu = cv2.HuMoments(moments).flatten()
+                    hu_log = np.array([-np.sign(h) * np.log10(abs(h) + 1e-30) for h in hu], dtype=np.float32)
+            except Exception:
+                hu_log = None
+            return idx, h, gray_small, pil, mask_small, hu_log, is_line
 
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
             futures = {ex.submit(prep_worker, i, p): i for i, p in enumerate(self.image_paths)}
             for fut in as_completed(futures):
                 self.throttle()
-                idx, h, gray, pil = fut.result()
+                idx, h, gray, pil, mask, hu, is_line = fut.result()
                 asset_hashes[idx] = h
                 asset_grays[idx] = gray
                 asset_pils[idx] = pil
+                asset_masks[idx] = mask
+                asset_hus[idx] = hu
+                # track whether this asset is primarily line-art; useful for outline comparisons
+                # use a dedicated list to avoid changing existing arrays
+                # create if not present
+                asset_is_line[idx] = bool(is_line)
                 done += 1
                 self.progress.emit(done, total_work)
 
@@ -528,9 +815,16 @@ class MatchWorker(QtCore.QObject):
             q_hash = qinfo["phash"]
             q_embed = qinfo["embed"]
             q_gray = qinfo["gray"]
+            q_mask = qinfo.get("mask")
+            q_hu = qinfo.get("hu")
+            q_is_line = qinfo.get("line_art", False)
 
             # support special mode for black & white tab
             mode = qinfo.get("mode", "default")
+            # shape method may be adjusted for line-art queries (prefer outline chamfer)
+            method_to_use = self.shape_method
+            if getattr(self, "shape_auto_method", False) and qinfo.get("line_art", False):
+                method_to_use = "outline_chamfer"
 
             ph_dists = np.array([q_hash - h for h in asset_hashes], dtype=np.float32)
             ph_sim = 1.0 - (ph_dists / 64.0)
@@ -574,40 +868,332 @@ class MatchWorker(QtCore.QObject):
                 w_cos_b = w_cos_b
                 w_ph_b = w_ph_b
 
-            base_score = w_cos_b * cos_norm + w_ph_b * ph_sim
+            # if in shape mode, compute a quick mask IoU vector and include in base score
+            if mode == "shape":
+                mask_iou_arr = np.zeros(len(asset_masks), dtype=np.float32)
+                if q_mask is not None:
+                    for j, am in enumerate(asset_masks):
+                        try:
+                            if am is None:
+                                mask_iou_arr[j] = 0.0
+                                continue
+                            a = am
+                            if a.shape != q_mask.shape:
+                                a = cv2.resize(a, (q_mask.shape[1], q_mask.shape[0]), interpolation=cv2.INTER_AREA)
+                            a_bin = (a > 0).astype(np.uint8)
+                            q_bin = (q_mask > 0).astype(np.uint8)
+                            inter = np.logical_and(a_bin, q_bin).sum()
+                            union = np.logical_or(a_bin, q_bin).sum()
+                            if union > 0:
+                                mask_iou_arr[j] = float(inter / union)
+                            else:
+                                mask_iou_arr[j] = 0.0
+                        except Exception:
+                            mask_iou_arr[j] = 0.0
+                # Use mask IoU as the primary base score in shape mode if a query mask exists
+                # This prioritizes candidates that closely match the query silhouette.
+                if q_mask is not None:
+                    # base primarily on mask IoU; include cos/phash as tie-breaker
+                    base_score = mask_iou_arr
+                    # slight bias from global embedding & pHash to stabilize ties
+                    base_score = base_score + 0.01 * (w_cos_b * cos_norm + w_ph_b * ph_sim)
+                else:
+                    mask_weight = min(1.0, self.weight_shape * 0.7)
+                    base_score = w_cos_b * cos_norm + w_ph_b * ph_sim + mask_weight * mask_iou_arr
+            else:
+                base_score = w_cos_b * cos_norm + w_ph_b * ph_sim
             idx_sorted = np.argsort(base_score)[::-1][:cand_count]
+            # if shape-only prefilter is enabled and we have a query mask, apply mask IoU thresholding
+            if self.shape_only and mode == "shape" and q_mask is not None:
+                prefilter_thresh = 0.08
+                keep_idxs = np.where(mask_iou_arr >= prefilter_thresh)[0]
+                if keep_idxs.size > 0:
+                    # keep only those indices, preserving order
+                    keep_set = set(keep_idxs.tolist())
+                    idx_sorted = [i for i in idx_sorted if i in keep_set]
 
             results = []
-            for i in idx_sorted:
-                self.throttle()
-                g = asset_grays[i]
+            if mode == "shape":
+                # prepare a contour for the query mask (largest contour)
                 try:
-                    # if in B&W mode, compare binarized versions to emphasize shape/contrast
-                    if mode == "bw":
-                        _, q_bin = cv2.threshold(q_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-                        _, g_bin = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-                        s_ssim = ssim(q_bin, g_bin, data_range=255)
+                    q_mask_local = q_mask
+                    if q_mask_local is None and q_gray is not None:
+                        # derive a mask from the query gray image to highlight black lines
+                        _, q_mask_local = cv2.threshold(q_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+                    if q_mask_local is not None:
+                        q_contours, _ = cv2.findContours(q_mask_local.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        q_contour = max(q_contours, key=cv2.contourArea) if q_contours else None
                     else:
-                        s_ssim = ssim(q_gray, g, data_range=255)
+                        q_contour = None
                 except Exception:
-                    s_ssim = 0.0
-                s_ssim = float(np.clip(s_ssim, 0.0, 1.0))
+                    q_contour = None
 
-                d = ph_dists[i]
-                boost = 0.0
-                if d <= self.boost_distance:
-                    boost = self.boost_value
+                adj_cos = self.weight_cos * 0.10
+                adj_ph = self.weight_phash * 0.6
+                # shape adjacent weight uses explicit weight_shape
+                adj_shape = self.weight_shape * 2.5
 
-                final = (
-                    w_cos_f * cos_norm[i]
-                    + w_ph_f * ph_sim[i]
-                    + w_ss_f * s_ssim
-                    + boost
-                )
-                results.append((float(final), self.image_paths[i]))
+                sum_final_adj = adj_cos + adj_ph + adj_shape
+                if sum_final_adj <= 0:
+                    w_cos_f = 0.0
+                    w_ph_f = 0.5
+                    w_shape_f = 0.5
+                else:
+                    w_cos_f = adj_cos / sum_final_adj
+                    w_ph_f = adj_ph / sum_final_adj
+                    w_shape_f = adj_shape / sum_final_adj
 
-                done += 1
-                self.progress.emit(done, total_work)
+                sum_base_adj = adj_cos + adj_ph
+                if sum_base_adj <= 0:
+                    w_cos_b = 0.3
+                    w_ph_b = 0.7
+                else:
+                    w_cos_b = adj_cos / sum_base_adj
+                    w_ph_b = adj_ph / sum_base_adj
+
+                for i in idx_sorted:
+                    self.throttle()
+                    shape_sim = 0.0
+                    g_mask = asset_masks[i]
+                    # derive masks or edges to compute shape similarity more robustly
+                    try:
+                        # prepare g_mask_local: if None try building from grayscale image
+                        if g_mask is None and asset_pils[i] is not None:
+                            try:
+                                fallback_gray = cv2.cvtColor(np.array(asset_pils[i].convert("RGB")), cv2.COLOR_RGB2GRAY)
+                                g_mask_local = (fallback_gray < 250).astype(np.uint8) * 255
+                            except Exception:
+                                g_mask_local = None
+                        else:
+                            g_mask_local = g_mask
+
+                        # if q_contour exists and g_mask_local exists, compute contour match
+                        shape_sim_contour = 0.0
+                        if q_contour is not None and g_mask_local is not None and g_mask_local.any():
+                            g_contours, _ = cv2.findContours(g_mask_local.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            g_contour = max(g_contours, key=cv2.contourArea) if g_contours else None
+                            if g_contour is not None and cv2.contourArea(g_contour) > 10:
+                                d = cv2.matchShapes(q_contour, g_contour, cv2.CONTOURS_MATCH_I1, 0.0)
+                                shape_sim_contour = float(np.clip(1.0 / (1.0 + d), 0.0, 1.0))
+
+                        # compute edge IoU: edge-based similarity (already in place)
+                        shape_sim_iou = 0.0
+                        if q_mask is not None and g_mask_local is not None:
+                            # edges
+                            try:
+                                q_edges = cv2.Canny(q_mask, 50, 150)
+                            except Exception:
+                                q_edges = cv2.Canny((q_mask > 0).astype(np.uint8) * 255, 50, 150)
+                            try:
+                                g_small = g_mask_local
+                                if g_small.shape != q_mask.shape:
+                                    g_small = cv2.resize(g_small, (q_mask.shape[1], q_mask.shape[0]), interpolation=cv2.INTER_AREA)
+                                g_edges = cv2.Canny(g_small, 50, 150)
+                            except Exception:
+                                g_edges = None
+                            if g_edges is not None:
+                                # compute IoU between binary edge maps
+                                qb = (q_edges > 0).astype(np.uint8)
+                                gb = (g_edges > 0).astype(np.uint8)
+                                # apply small dilation to better align edges (robust to thin lines)
+                                kernel = np.ones((3,3), dtype=np.uint8)
+                                qb = cv2.dilate(qb, kernel, iterations=1)
+                                gb = cv2.dilate(gb, kernel, iterations=1)
+                                inter = np.logical_and(qb, gb).sum()
+                                union = np.logical_or(qb, gb).sum()
+                                if union > 0:
+                                    shape_sim_iou = float(inter / union)
+                                else:
+                                    shape_sim_iou = 0.0
+
+                        # final shape similarity based on selected shape method
+                        if method_to_use == "hu_moments":
+                            # use Hu moment distances (scale/rotation invariant)
+                            try:
+                                g_hu = asset_hus[i]
+                                if q_hu is not None and g_hu is not None:
+                                    d_hu = float(np.linalg.norm(q_hu - g_hu))
+                                    shape_sim = float(1.0 / (1.0 + d_hu))
+                                else:
+                                    shape_sim = 0.0
+                            except Exception:
+                                shape_sim = 0.0
+                        elif method_to_use == "matchshapes":
+                            shape_sim = shape_sim_contour
+                        elif method_to_use == "chamfer":
+                            # compute Chamfer-like symmetric distance between edge maps and convert to similarity
+                            try:
+                                # need q_edges and g_edges
+                                if q_mask is not None:
+                                    try:
+                                        q_edges = cv2.Canny(q_mask, 50, 150)
+                                    except Exception:
+                                        q_edges = cv2.Canny((q_mask > 0).astype(np.uint8) * 255, 50, 150)
+                                else:
+                                    q_edges = None
+                                if g_mask_local is not None:
+                                    try:
+                                        g_small = g_mask_local
+                                        if g_small.shape != (q_mask.shape if q_mask is not None else g_small).shape:
+                                            # if q_mask is None, keep g_small shape
+                                            g_small = cv2.resize(g_small, (q_mask.shape[1], q_mask.shape[0]), interpolation=cv2.INTER_AREA)
+                                        g_edges = cv2.Canny(g_small, 50, 150)
+                                    except Exception:
+                                        g_edges = None
+                                else:
+                                    g_edges = None
+                                if q_edges is not None and g_edges is not None:
+                                    # distance transform of g_edges
+                                    gb = (g_edges > 0).astype(np.uint8)
+                                    qb = (q_edges > 0).astype(np.uint8)
+                                    # compute dt from zero pixels (invert edges to get 0 on edges)
+                                    try:
+                                        dt_g = cv2.distanceTransform((1 - gb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                                        dt_q = cv2.distanceTransform((1 - qb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                                        # sample dt_g at q edge locations
+                                        q_points = np.where(qb > 0)
+                                        g_points = np.where(gb > 0)
+                                        if q_points[0].size > 0:
+                                            avg_g = float(dt_g[q_points].mean())
+                                        else:
+                                            avg_g = float(dt_g.mean())
+                                        if g_points[0].size > 0:
+                                            avg_q = float(dt_q[g_points].mean())
+                                        else:
+                                            avg_q = float(dt_q.mean())
+                                        # normalize by diagonal length
+                                        h, w = q_mask.shape if q_mask is not None else g_small.shape
+                                        diag = np.sqrt(h ** 2 + w ** 2) + 1e-8
+                                        chamfer_d = (avg_g + avg_q) / 2.0 / diag
+                                        shape_sim = float(1.0 / (1.0 + chamfer_d * 10.0))
+                                    except Exception:
+                                        shape_sim = 0.0
+                                else:
+                                    shape_sim = 0.0
+                            except Exception:
+                                shape_sim = 0.0
+                        elif method_to_use == "outline_chamfer":
+                            # compute Chamfer-like symmetric distance on skeletons (suitable for line art)
+                            try:
+                                # prepare skeletons for q and g
+                                # q_skel: from q_mask if line-art or from edges
+                                if q_is_line and q_mask is not None:
+                                    q_skel = (q_mask > 0).astype(np.uint8)
+                                else:
+                                    if q_mask is not None:
+                                        q_edges = cv2.Canny(q_mask, 50, 150)
+                                    elif q_gray is not None:
+                                        q_edges = cv2.Canny(q_gray, 50, 150)
+                                    else:
+                                        q_edges = None
+                                    if q_edges is not None:
+                                        try:
+                                            q_skel_bool = skeletonize((q_edges > 0))
+                                            q_skel = (q_skel_bool.astype(np.uint8))
+                                        except Exception:
+                                            q_skel = (q_edges > 0).astype(np.uint8)
+                                    else:
+                                        q_skel = None
+
+                                # g_skel: from g_mask_local if asset is line; otherwise compute from edges
+                                if g_mask_local is not None and (asset_is_line[i] if 'asset_is_line' in locals() else False):
+                                    g_skel = (g_mask_local > 0).astype(np.uint8)
+                                else:
+                                    if g_mask_local is not None:
+                                        g_edges = cv2.Canny(g_mask_local, 50, 150)
+                                    elif asset_pils[i] is not None:
+                                        try:
+                                            pil_rgb = np.array(asset_pils[i].convert("RGB"))
+                                            pil_gray = cv2.cvtColor(pil_rgb, cv2.COLOR_RGB2GRAY)
+                                            g_edges = cv2.Canny(pil_gray, 50, 150)
+                                        except Exception:
+                                            g_edges = None
+                                    else:
+                                        g_edges = None
+                                    if g_edges is not None:
+                                        try:
+                                            g_skel_bool = skeletonize((g_edges > 0))
+                                            g_skel = (g_skel_bool.astype(np.uint8))
+                                        except Exception:
+                                            g_skel = (g_edges > 0).astype(np.uint8)
+                                    else:
+                                        g_skel = None
+
+                                if q_skel is not None and g_skel is not None:
+                                    qb = (q_skel > 0).astype(np.uint8)
+                                    gb = (g_skel > 0).astype(np.uint8)
+                                    dt_g = cv2.distanceTransform((1 - gb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                                    dt_q = cv2.distanceTransform((1 - qb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                                    q_points = np.where(qb > 0)
+                                    g_points = np.where(gb > 0)
+                                    if q_points[0].size > 0:
+                                        avg_g = float(dt_g[q_points].mean())
+                                    else:
+                                        avg_g = float(dt_g.mean())
+                                    if g_points[0].size > 0:
+                                        avg_q = float(dt_q[g_points].mean())
+                                    else:
+                                        avg_q = float(dt_q.mean())
+                                    h, w = q_mask.shape if q_mask is not None else g_mask_local.shape
+                                    diag = np.sqrt(h ** 2 + w ** 2) + 1e-8
+                                    chamfer_d = (avg_g + avg_q) / 2.0 / diag
+                                    shape_sim = float(1.0 / (1.0 + chamfer_d * 10.0))
+                                else:
+                                    shape_sim = 0.0
+                            except Exception:
+                                shape_sim = 0.0
+                        else:
+                            # contour_iou or default -> combine contour and edge IoU
+                            shape_sim = 0.6 * shape_sim_iou + 0.4 * shape_sim_contour
+                    except Exception:
+                        shape_sim = 0.0
+
+                    boost = 0.0
+                    d = ph_dists[i]
+                    if d <= self.boost_distance:
+                        boost = self.boost_value
+
+                    final = (
+                        w_cos_f * cos_norm[i]
+                        + w_ph_f * ph_sim[i]
+                        + w_shape_f * shape_sim
+                        + boost
+                    )
+                    results.append((float(final), self.image_paths[i]))
+
+                    done += 1
+                    self.progress.emit(done, total_work)
+            else:
+                for i in idx_sorted:
+                    self.throttle()
+                    g = asset_grays[i]
+                    try:
+                        # if in B&W mode, compare binarized versions to emphasize shape/contrast
+                        if mode == "bw":
+                            _, q_bin = cv2.threshold(q_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                            _, g_bin = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                            s_ssim = ssim(q_bin, g_bin, data_range=255)
+                        else:
+                            s_ssim = ssim(q_gray, g, data_range=255)
+                    except Exception:
+                        s_ssim = 0.0
+                    s_ssim = float(np.clip(s_ssim, 0.0, 1.0))
+
+                    d = ph_dists[i]
+                    boost = 0.0
+                    if d <= self.boost_distance:
+                        boost = self.boost_value
+
+                    final = (
+                        w_cos_f * cos_norm[i]
+                        + w_ph_f * ph_sim[i]
+                        + w_ss_f * s_ssim
+                        + boost
+                    )
+                    results.append((float(final), self.image_paths[i]))
+
+                    done += 1
+                    self.progress.emit(done, total_work)
 
             results.sort(key=lambda x: x[0], reverse=True)
             results_by_tab[q_idx] = results[:25]
@@ -658,6 +1244,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.weight_cos = DEFAULT_W_COS
         self.weight_phash = DEFAULT_W_PHASH
         self.weight_ssim = DEFAULT_W_SSIM
+        self.weight_shape = DEFAULT_W_SHAPE
+        self.shape_method = "contour_iou"
         self.boost_distance = DEFAULT_BOOST_DIST
         self.boost_value = DEFAULT_BOOST_VAL
         self.candidate_limit = DEFAULT_CAND_LIMIT
@@ -796,6 +1384,8 @@ class MainWindow(QtWidgets.QMainWindow):
             feat = feat / (feat.norm(dim=1, keepdim=True) + 1e-8)
             return feat.cpu().numpy()[0]
 
+    # Note: compute_mask_and_hu_from_pil is now provided as a top-level helper
+
     # ----- UI -----
 
     def build_ui(self):
@@ -829,6 +1419,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.paste_tabs.addTab(tab, f"Tab {i+1}")
             # when a tab toggles its BW mode, persist config
             tab.modeChanged.connect(self.save_config)
+            tab.debugRequested.connect(self.on_tab_debug_requested)
         # enable right-click rename on the tab bar
         tb = self.paste_tabs.tabBar()
         tb.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
@@ -878,6 +1469,331 @@ class MainWindow(QtWidgets.QMainWindow):
         # sync paste tabs <-> results tabs
         self.paste_tabs.currentChanged.connect(self.on_paste_tab_changed)
         self.results_tabs.currentChanged.connect(self.on_results_tab_changed)
+
+    def on_tab_debug_requested(self):
+        idx = self.paste_tabs.currentIndex()
+        rt: ResultsTab = self.results_tabs.widget(idx)
+        if not rt or not rt.results:
+            QtWidgets.QMessageBox.information(self, "Debug Shapes", "No results available for this tab to debug.")
+            return
+        top_path = rt.results[0][1]
+        q_tab: ImageTab = self.paste_tabs.widget(idx)
+        if q_tab.query_image_pil is None:
+            QtWidgets.QMessageBox.information(self, "Debug Shapes", "This tab does not have a query image.")
+            return
+        try:
+            cand = Image.open(top_path).convert("RGBA")
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "Debug Shapes", "Failed to open candidate image.")
+            return
+
+        # compute masks and Hu
+        # compute_mask_and_hu_from_pil is a top-level helper; handle gracefully if query image is not set
+        if q_tab.query_image_pil is None:
+            QtWidgets.QMessageBox.warning(self, "Debug", "Tab has no query image set")
+            return
+        q_mask, q_hu, q_is_line = compute_mask_and_hu_from_pil(q_tab.query_image_pil)
+        g_mask, g_hu, g_is_line = compute_mask_and_hu_from_pil(cand)
+
+        # edges
+        q_edges = None
+        g_edges = None
+        try:
+            if q_mask is not None:
+                q_edges = cv2.Canny(q_mask, 50, 150)
+            if g_mask is not None:
+                g_edges = cv2.Canny(g_mask, 50, 150)
+        except Exception:
+            pass
+
+        # skeletons (used for outline-chamfer debug)
+        q_skel = None
+        g_skel = None
+        try:
+            if q_is_line and q_mask is not None:
+                q_skel = (q_mask > 0).astype(np.uint8)
+            elif q_edges is not None:
+                try:
+                    q_skel_bool = skeletonize((q_edges > 0))
+                    q_skel = q_skel_bool.astype(np.uint8)
+                except Exception:
+                    q_skel = (q_edges > 0).astype(np.uint8)
+
+            if g_is_line and g_mask is not None:
+                g_skel = (g_mask > 0).astype(np.uint8)
+            elif g_edges is not None:
+                try:
+                    g_skel_bool = skeletonize((g_edges > 0))
+                    g_skel = g_skel_bool.astype(np.uint8)
+                except Exception:
+                    g_skel = (g_edges > 0).astype(np.uint8)
+        except Exception:
+            q_skel = None
+            g_skel = None
+
+        # metrics
+        metrics = {}
+        try:
+            if q_hu is not None and g_hu is not None:
+                d_hu = float(np.linalg.norm(q_hu - g_hu))
+                metrics['hu_distance'] = d_hu
+                metrics['hu_similarity'] = 1.0 / (1.0 + d_hu)
+            if q_mask is not None and g_mask is not None:
+                # compute contour match
+                try:
+                    q_contours, _ = cv2.findContours(q_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    q_contour = max(q_contours, key=cv2.contourArea) if q_contours else None
+                except Exception:
+                    q_contour = None
+                try:
+                    g_contours, _ = cv2.findContours(g_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    g_contour = max(g_contours, key=cv2.contourArea) if g_contours else None
+                except Exception:
+                    g_contour = None
+                if q_contour is not None and g_contour is not None:
+                    d = cv2.matchShapes(q_contour, g_contour, cv2.CONTOURS_MATCH_I1, 0.0)
+                    metrics['matchshapes_d'] = d
+                    metrics['matchshapes_similarity'] = 1.0 / (1.0 + d)
+                # edge IoU
+                try:
+                    qb = (q_edges > 0).astype(np.uint8)
+                    gb = (g_edges > 0).astype(np.uint8)
+                    kernel = np.ones((3,3), dtype=np.uint8)
+                    qb = cv2.dilate(qb, kernel, iterations=1)
+                    gb = cv2.dilate(gb, kernel, iterations=1)
+                    inter = np.logical_and(qb, gb).sum()
+                    union = np.logical_or(qb, gb).sum()
+                    metrics['edge_iou'] = float(inter / union) if union > 0 else 0.0
+                except Exception:
+                    metrics['edge_iou'] = 0.0
+            # Add detection flags to the debug metrics
+            metrics['q_is_line_art'] = bool(q_is_line)
+            metrics['g_is_line_art'] = bool(g_is_line)
+        except Exception as ex:
+            metrics['error'] = str(ex)
+        # determine method used (main window setting auto-switched for line-art)
+        try:
+            method_to_use_local = self.shape_method
+            if method_to_use_local == 'chamfer' and q_is_line:
+                method_to_use_local = 'outline_chamfer'
+            metrics['method_used'] = method_to_use_local
+        except Exception:
+            metrics['method_used'] = self.shape_method
+
+        # recompute a shape_sim for the pair using UI method and any auto-switch
+        method_to_use_local = self.shape_method
+        if method_to_use_local == 'chamfer' and q_is_line:
+            method_to_use_local = 'outline_chamfer'
+        metrics['method_used'] = method_to_use_local
+        # recompute shape similarity locally for debug
+        try:
+            # compute contour similarity and edge IoU as base
+            shape_sim_contour = 0.0
+            shape_sim_iou = 0.0
+            if q_mask is not None and g_mask is not None:
+                try:
+                    q_contours, _ = cv2.findContours(q_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    q_contour = max(q_contours, key=cv2.contourArea) if q_contours else None
+                except Exception:
+                    q_contour = None
+                try:
+                    g_contours, _ = cv2.findContours(g_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    g_contour = max(g_contours, key=cv2.contourArea) if g_contours else None
+                except Exception:
+                    g_contour = None
+                if q_contour is not None and g_contour is not None:
+                    try:
+                        d = cv2.matchShapes(q_contour, g_contour, cv2.CONTOURS_MATCH_I1, 0.0)
+                        shape_sim_contour = float(np.clip(1.0 / (1.0 + d), 0.0, 1.0))
+                        metrics['matchshapes_similarity'] = shape_sim_contour
+                    except Exception:
+                        shape_sim_contour = 0.0
+                try:
+                    qb = (q_edges > 0).astype(np.uint8) if q_edges is not None else None
+                    gb = (g_edges > 0).astype(np.uint8) if g_edges is not None else None
+                    if qb is not None and gb is not None:
+                        kernel = np.ones((3,3), dtype=np.uint8)
+                        qb = cv2.dilate(qb, kernel, iterations=1)
+                        gb = cv2.dilate(gb, kernel, iterations=1)
+                        inter = np.logical_and(qb, gb).sum()
+                        union = np.logical_or(qb, gb).sum()
+                        if union > 0:
+                            shape_sim_iou = float(inter / union)
+                except Exception:
+                    shape_sim_iou = 0.0
+
+            shape_sim_recomputed = 0.6 * shape_sim_iou + 0.4 * shape_sim_contour
+            if method_to_use_local == 'hu_moments':
+                if q_hu is not None and g_hu is not None:
+                    d_hu = float(np.linalg.norm(q_hu - g_hu))
+                    shape_sim_recomputed = 1.0 / (1.0 + d_hu)
+                else:
+                    shape_sim_recomputed = 0.0
+            elif method_to_use_local == 'matchshapes':
+                shape_sim_recomputed = shape_sim_contour
+            elif method_to_use_local == 'chamfer':
+                try:
+                    if q_edges is None and q_mask is not None:
+                        q_edges = cv2.Canny(q_mask, 50, 150)
+                    if g_edges is None and g_mask is not None:
+                        g_edges = cv2.Canny(g_mask, 50, 150)
+                    if q_edges is not None and g_edges is not None:
+                        gb = (g_edges > 0).astype(np.uint8)
+                        qb = (q_edges > 0).astype(np.uint8)
+                        dt_g = cv2.distanceTransform((1 - gb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                        dt_q = cv2.distanceTransform((1 - qb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                        q_points = np.where(qb > 0)
+                        g_points = np.where(gb > 0)
+                        if q_points[0].size > 0:
+                            avg_g = float(dt_g[q_points].mean())
+                        else:
+                            avg_g = float(dt_g.mean())
+                        if g_points[0].size > 0:
+                            avg_q = float(dt_q[g_points].mean())
+                        else:
+                            avg_q = float(dt_q.mean())
+                        h, w = q_mask.shape if q_mask is not None else g_mask.shape
+                        diag = np.sqrt(h ** 2 + w ** 2) + 1e-8
+                        chamfer_d = (avg_g + avg_q) / 2.0 / diag
+                        shape_sim_recomputed = float(1.0 / (1.0 + chamfer_d * 10.0))
+                except Exception:
+                    shape_sim_recomputed = 0.0
+            elif method_to_use_local == 'outline_chamfer':
+                try:
+                    if q_is_line:
+                        qb = (q_mask > 0).astype(np.uint8)
+                        q_skel = qb
+                    else:
+                        q_edges_local = q_edges if q_edges is not None else (cv2.Canny(q_gray, 50, 150) if q_gray is not None else None)
+                        if q_edges_local is not None:
+                            try:
+                                q_skel_bool = skeletonize((q_edges_local > 0))
+                                q_skel = (q_skel_bool.astype(np.uint8))
+                            except Exception:
+                                q_skel = (q_edges_local > 0).astype(np.uint8)
+                        else:
+                            q_skel = None
+                    if g_is_line:
+                        gb = (g_mask > 0).astype(np.uint8)
+                        g_skel = gb
+                    else:
+                        if g_edges is None and g_mask is not None:
+                            g_edges = cv2.Canny(g_mask, 50, 150)
+                        if g_edges is not None:
+                            try:
+                                g_skel_bool = skeletonize((g_edges > 0))
+                                g_skel = (g_skel_bool.astype(np.uint8))
+                            except Exception:
+                                g_skel = (g_edges > 0).astype(np.uint8)
+                        else:
+                            g_skel = None
+                    if q_skel is not None and g_skel is not None:
+                        qb = (q_skel > 0).astype(np.uint8)
+                        gb = (g_skel > 0).astype(np.uint8)
+                        dt_g = cv2.distanceTransform((1 - gb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                        dt_q = cv2.distanceTransform((1 - qb).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+                        q_points = np.where(qb > 0)
+                        g_points = np.where(gb > 0)
+                        if q_points[0].size > 0:
+                            avg_g = float(dt_g[q_points].mean())
+                        else:
+                            avg_g = float(dt_g.mean())
+                        if g_points[0].size > 0:
+                            avg_q = float(dt_q[g_points].mean())
+                        else:
+                            avg_q = float(dt_q.mean())
+                        h, w = q_mask.shape if q_mask is not None else g_mask.shape
+                        diag = np.sqrt(h ** 2 + w ** 2) + 1e-8
+                        chamfer_d = (avg_g + avg_q) / 2.0 / diag
+                        shape_sim_recomputed = float(1.0 / (1.0 + chamfer_d * 10.0))
+                    else:
+                        shape_sim_recomputed = 0.0
+                except Exception:
+                    shape_sim_recomputed = 0.0
+            metrics['shape_sim_recomputed'] = float(np.clip(shape_sim_recomputed, 0.0, 1.0))
+        except Exception:
+            pass
+
+        # create dialog to show visualizations
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Shape Debug: Query vs Top Result")
+        dlg.resize(900, 480)
+        layout = QtWidgets.QHBoxLayout(dlg)
+
+        def img_label_from_arr(arr, title):
+            widget = QtWidgets.QWidget()
+            v = QtWidgets.QVBoxLayout(widget)
+            v.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+            lbl = QtWidgets.QLabel(title)
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(lbl)
+            if arr is None:
+                imglbl = QtWidgets.QLabel("(none)")
+            else:
+                pil = None
+                try:
+                    if isinstance(arr, Image.Image):
+                        pil = arr
+                    elif isinstance(arr, np.ndarray):
+                        if arr.ndim == 2:
+                            # grayscale / mask / edges
+                            a = arr.copy()
+                            if a.dtype != np.uint8:
+                                # normalize
+                                a = (255 * (a / a.max())).astype('uint8') if a.max() > 1 else (a * 255).astype('uint8')
+                            pil = Image.fromarray(a).convert('L').convert('RGBA')
+                        elif arr.ndim == 3 and arr.shape[2] in (3, 4):
+                            a = arr.copy().astype('uint8')
+                            pil = Image.fromarray(a)
+                            if pil.mode != 'RGBA':
+                                pil = pil.convert('RGBA')
+                    if pil is not None:
+                        pix = pil_to_qpixmap(pil)
+                        imglbl = QtWidgets.QLabel()
+                        imglbl.setPixmap(pix)
+                    else:
+                        imglbl = QtWidgets.QLabel("(unrenderable)")
+                except Exception:
+                    imglbl = QtWidgets.QLabel("(error rendering)")
+            imglbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(imglbl)
+            return widget
+
+        # left column: query visualizations
+        q_img_w = img_label_from_arr(np.array(q_tab.query_image_pil.convert("RGBA")), "Query (original)")
+        q_mask_w = img_label_from_arr(q_mask, "Query Mask")
+        q_edges_w = img_label_from_arr(q_edges, "Query Edges")
+        q_skel_w = img_label_from_arr(q_skel, "Query Skeleton")
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.addWidget(q_img_w)
+        left_col.addWidget(q_mask_w)
+        left_col.addWidget(q_edges_w)
+        left_col.addWidget(q_skel_w)
+
+        # right column: candidate visualizations
+        cand_img_w = img_label_from_arr(np.array(cand.convert("RGBA")), "Candidate (original)")
+        c_mask_w = img_label_from_arr(g_mask, "Candidate Mask")
+        c_edges_w = img_label_from_arr(g_edges, "Candidate Edges")
+        c_skel_w = img_label_from_arr(g_skel, "Candidate Skeleton")
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.addWidget(cand_img_w)
+        right_col.addWidget(c_mask_w)
+        right_col.addWidget(c_edges_w)
+        right_col.addWidget(c_skel_w)
+
+        layout.addLayout(left_col)
+        layout.addLayout(right_col)
+
+        # bottom: show metrics
+        met_str = "\n".join([f"{k}: {v}" for k, v in metrics.items()])
+        metrics_lbl = QtWidgets.QLabel(met_str)
+        metrics_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        metrics_lbl.setWordWrap(True)
+        dlg_layout = QtWidgets.QVBoxLayout()
+        dlg_layout.addLayout(layout)
+        dlg_layout.addWidget(metrics_lbl)
+        dlg.setLayout(dlg_layout)
+        dlg.exec()
 
     def build_main_sidebar_page(self):
         page = QtWidgets.QWidget()
@@ -1086,6 +2002,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_w_ssim.setMinimumWidth(120)
         m_layout.addRow("SSIM weight:", self.spin_w_ssim)
 
+        self.shape_method_combo = QtWidgets.QComboBox()
+        self.shape_method_combo.addItem("Contour + Edge IoU", "contour_iou")
+        self.shape_method_combo.addItem("Hu Moments", "hu_moments")
+        self.shape_method_combo.addItem("MatchShapes (cv2)", "matchshapes")
+        self.shape_method_combo.addItem("Chamfer (edge distance)", "chamfer")
+        self.shape_method_combo.addItem("Outline Chamfer (skeleton)", "outline_chamfer")
+        self.shape_method_combo.setMinimumWidth(180)
+        m_layout.addRow("Shape method:", self.shape_method_combo)
+
+        self.spin_w_shape = QtWidgets.QDoubleSpinBox()
+        self.spin_w_shape.setRange(0.0, 10.0)
+        self.spin_w_shape.setSingleStep(0.05)
+        self.spin_w_shape.setDecimals(3)
+        self.spin_w_shape.setValue(DEFAULT_W_SHAPE)
+        self.spin_w_shape.setMinimumWidth(120)
+        m_layout.addRow("Shape weight:", self.spin_w_shape)
+
         self.spin_boost_dist = QtWidgets.QSpinBox()
         self.spin_boost_dist.setRange(0, 64)
         self.spin_boost_dist.setValue(DEFAULT_BOOST_DIST)
@@ -1105,6 +2038,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_cand_limit.setValue(DEFAULT_CAND_LIMIT)
         self.spin_cand_limit.setMinimumWidth(120)
         m_layout.addRow("Candidate limit:", self.spin_cand_limit)
+
+        self.check_shape_only = QtWidgets.QCheckBox("Shape-only prefilter")
+        self.check_shape_only.setToolTip("When enabled, shape-mode will use mask IoU as the main candidate filter")
+        m_layout.addRow(self.check_shape_only)
+
+        self.check_shape_align = QtWidgets.QCheckBox("Auto align & scale shapes")
+        self.check_shape_align.setToolTip("When enabled, shape matching will normalize scale/center of shapes for comparison")
+        self.check_shape_align.setChecked(True)
+        m_layout.addRow(self.check_shape_align)
+        self.check_shape_auto_method = QtWidgets.QCheckBox("Auto switch method for line-art")
+        self.check_shape_auto_method.setToolTip("Automatically use outline chamfer method for line-art queries")
+        self.check_shape_auto_method.setChecked(True)
+        m_layout.addRow(self.check_shape_auto_method)
+
+        # Line-art detection thresholds
+        self.spin_line_cov = QtWidgets.QDoubleSpinBox()
+        self.spin_line_cov.setRange(0.0, 1.0)
+        self.spin_line_cov.setSingleStep(0.01)
+        self.spin_line_cov.setDecimals(3)
+        self.spin_line_cov.setValue(DEFAULT_LINE_ART_COV)
+        self.spin_line_cov.setMinimumWidth(120)
+        m_layout.addRow("Line-art filled coverage threshold:", self.spin_line_cov)
+
+        self.spin_line_edge = QtWidgets.QDoubleSpinBox()
+        self.spin_line_edge.setRange(0.0, 1.0)
+        self.spin_line_edge.setSingleStep(0.01)
+        self.spin_line_edge.setDecimals(3)
+        self.spin_line_edge.setValue(DEFAULT_LINE_ART_EDGE)
+        self.spin_line_edge.setMinimumWidth(120)
+        m_layout.addRow("Line-art edge coverage threshold:", self.spin_line_edge)
+
+        # Prefilter IoU threshold
+        self.spin_prefilter_iou = QtWidgets.QDoubleSpinBox()
+        self.spin_prefilter_iou.setRange(0.0, 1.0)
+        self.spin_prefilter_iou.setSingleStep(0.01)
+        self.spin_prefilter_iou.setDecimals(3)
+        self.spin_prefilter_iou.setValue(DEFAULT_PREFILTER_IOU)
+        self.spin_prefilter_iou.setMinimumWidth(120)
+        m_layout.addRow("Shape prefilter IoU:", self.spin_prefilter_iou)
 
         layout.addWidget(grp_match)
 
@@ -1194,6 +2166,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.weight_cos = float(weights.get("cosine", self.weight_cos))
         self.weight_phash = float(weights.get("phash", self.weight_phash))
         self.weight_ssim = float(weights.get("ssim", self.weight_ssim))
+        self.weight_shape = float(weights.get("shape", self.weight_shape))
+        self.shape_method = data.get("shape_method", self.shape_method)
+        self.shape_only = data.get("shape_only", False)
+        self.shape_auto_align = data.get("shape_auto_align", True)
+        self.shape_auto_method = data.get("shape_auto_method", True)
+        self.line_art_cov = float(data.get("line_art_cov", DEFAULT_LINE_ART_COV))
+        self.line_art_edge = float(data.get("line_art_edge", DEFAULT_LINE_ART_EDGE))
+        self.prefilter_iou = float(data.get("prefilter_iou", DEFAULT_PREFILTER_IOU))
+        self.shape_auto_method = data.get("shape_auto_method", True)
         self.boost_distance = int(weights.get("boost_distance", self.boost_distance))
         self.boost_value = float(weights.get("boost_value", self.boost_value))
         self.candidate_limit = int(weights.get("candidate_limit", self.candidate_limit))
@@ -1205,6 +2186,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # per-tab settings
         self.tab_names = data.get("tab_names", [])
         self.tab_bw = data.get("tab_bw", [])
+        self.tab_shape = data.get("tab_shape", [])
 
     def save_config(self):
         data = {
@@ -1220,10 +2202,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "cosine": self.weight_cos,
                 "phash": self.weight_phash,
                 "ssim": self.weight_ssim,
+                "shape": self.weight_shape,
+                "shape_method": self.shape_method,
+                "shape_only": bool(self.shape_only),
+                "shape_auto_align": bool(self.shape_auto_align),
+                "shape_auto_method": bool(self.shape_auto_method),
                 "boost_distance": self.boost_distance,
                 "boost_value": self.boost_value,
                 "candidate_limit": self.candidate_limit,
             },
+            "line_art_cov": float(getattr(self, 'line_art_cov', DEFAULT_LINE_ART_COV)),
+            "line_art_edge": float(getattr(self, 'line_art_edge', DEFAULT_LINE_ART_EDGE)),
+            "prefilter_iou": float(getattr(self, 'prefilter_iou', DEFAULT_PREFILTER_IOU)),
             "split_top_height": self.split_top_height,
             "split_bottom_height": self.split_bottom_height,
             "split_left_width": self.split_left_width,
@@ -1238,12 +2228,15 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             names = []
             bw = []
+            shape = []
             for i in range(self.paste_tabs.count()):
                 names.append(self.paste_tabs.tabText(i))
                 tab = self.paste_tabs.widget(i)
                 bw.append(bool(getattr(tab, "is_bw", False)))
+                shape.append(bool(getattr(tab, "is_shape", False)))
             data["tab_names"] = names
             data["tab_bw"] = bw
+            data["tab_shape"] = shape
         except Exception:
             pass
 
@@ -1281,9 +2274,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_w_cos.setValue(self.weight_cos)
         self.spin_w_phash.setValue(self.weight_phash)
         self.spin_w_ssim.setValue(self.weight_ssim)
+        self.spin_w_shape.setValue(self.weight_shape)
+        # set the saved method
+        try:
+            idx = self.shape_method_combo.findData(self.shape_method)
+            if idx >= 0:
+                self.shape_method_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
+        except Exception:
+            pass
         self.spin_boost_dist.setValue(self.boost_distance)
         self.spin_boost_val.setValue(self.boost_value)
         self.spin_cand_limit.setValue(self.candidate_limit)
+        # reflect shape settings
+        try:
+            self.check_shape_only.setChecked(bool(self.shape_only))
+            self.check_shape_align.setChecked(bool(self.shape_auto_align))
+            self.check_shape_auto_method.setChecked(bool(self.shape_auto_method))
+            self.spin_line_cov.setValue(getattr(self, 'line_art_cov', DEFAULT_LINE_ART_COV))
+            self.spin_line_edge.setValue(getattr(self, 'line_art_edge', DEFAULT_LINE_ART_EDGE))
+            self.spin_prefilter_iou.setValue(getattr(self, 'prefilter_iou', DEFAULT_PREFILTER_IOU))
+        except Exception:
+            pass
+        # spin_w_shape is added to the matching group later
 
         self.update_results_tab_layout()
 
@@ -1322,6 +2336,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "tab_bw") and i < len(self.tab_bw):
                     tab: ImageTab = self.paste_tabs.widget(i)
                     tab.set_bw_mode(bool(self.tab_bw[i]))
+                if hasattr(self, "tab_shape") and i < len(self.tab_shape):
+                    tab.set_shape_mode(bool(self.tab_shape[i]))
         except Exception:
             pass
 
@@ -1353,6 +2369,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.weight_cos = self.spin_w_cos.value()
         self.weight_phash = self.spin_w_phash.value()
         self.weight_ssim = self.spin_w_ssim.value()
+        self.weight_shape = self.spin_w_shape.value()
+        try:
+            self.shape_method = self.shape_method_combo.currentData()
+        except Exception:
+            pass
+        self.shape_only = bool(self.check_shape_only.isChecked())
+        self.shape_auto_align = bool(self.check_shape_align.isChecked())
+        self.shape_auto_method = bool(self.check_shape_auto_method.isChecked())
         self.boost_distance = self.spin_boost_dist.value()
         self.boost_value = self.spin_boost_val.value()
         self.candidate_limit = self.spin_cand_limit.value()
@@ -1397,6 +2421,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_boost_dist.setValue(DEFAULT_BOOST_DIST)
         self.spin_boost_val.setValue(DEFAULT_BOOST_VAL)
         self.spin_cand_limit.setValue(DEFAULT_CAND_LIMIT)
+        # reset shape options to defaults
+        try:
+            self.check_shape_only.setChecked(False)
+            self.check_shape_align.setChecked(True)
+        except Exception:
+            pass
 
         self.apply_settings_from_ui()
 
@@ -1425,6 +2455,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tab.query_embed = self.compute_embedding(pil)
         gray = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2GRAY)
         tab.query_gray = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
+        # compute query mask and Hu moments via helper
+        mask_small, hu, is_line = compute_mask_and_hu_from_pil(pil)
+        tab.query_mask = mask_small
+        tab.query_hu = hu
+        tab.query_is_line = bool(is_line)
 
     def load_images_into_tabs(self, paths: list[str], start_index: int):
         idx = start_index
@@ -1533,7 +2568,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         "phash": tab.query_phash,
                         "embed": tab.query_embed,
                         "gray": tab.query_gray,
-                        "mode": "bw" if getattr(tab, "is_bw", False) else "default",
+                        "mask": getattr(tab, "query_mask", None),
+                        "hu": getattr(tab, "query_hu", None),
+                        "line_art": getattr(tab, "query_is_line", False),
+                        "mode": (
+                            "shape" if getattr(tab, "is_shape", False) else
+                            ("bw" if getattr(tab, "is_bw", False) else "default")
+                        ),
                     }
                 )
 
@@ -1588,9 +2629,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.weight_cos,
             self.weight_phash,
             self.weight_ssim,
+            self.weight_shape,
+            self.shape_method,
             self.boost_distance,
             self.boost_value,
             self.candidate_limit,
+            self.shape_only,
+            self.shape_auto_method,
         )
         self.worker.moveToThread(self.thread)
 

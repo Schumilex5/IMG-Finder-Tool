@@ -14,6 +14,8 @@ A PyQt6-based image similarity finder that uses deep learning embeddings and mul
 - **Multiple Similarity Metrics**: Combines cosine similarity, perceptual hashing, and SSIM
 - **Configurable Matching**: Adjust weights for different similarity algorithms
 - **B&W Mode**: Per-tab toggle for black & white image matching with optimized SSIM on binarized images
+- **Shape Matching**: Per-tab 'Shape' toggle to focus on matching black-lined shapes on transparent-background images (contour-based shape matching)
+	- **Shape weight**: A new setting to control how much the shape similarity contributes to the final ranking (available in Settings -> Matching Weights).
 - **Tab Renaming**: Right-click any tab to rename it (tabs are saved in config)
 - **Cross-Tab Moving**: Select images across multiple result tabs and move them all at once
 - **Responsive UI**: Compact, grid-based layout that adapts to window size
@@ -26,6 +28,7 @@ A PyQt6-based image similarity finder that uses deep learning embeddings and mul
 The application uses an optimized responsive grid layout:
 - **Tabs**: Load/paste images into tabs (max 10 tabs). Rename any tab by right-clicking it.
 - **B&W Button**: Each tab has a B&W toggle button (left of the preview). Enable for black & white matching mode.
+- **Shape Button**: Shape toggle appears above the B&W button; enable it to match black-lined shapes (e.g. line-art) against transparent-background images.
 - **Info Icon**: Click the "i" icon in the top-right corner of each tab for instructions on paste/drag/load.
 - **Folder Buttons**: Scan and Output folder selection on the same row
 - **Action Buttons**: Run All (green), Move, and Settings with efficient spacing
@@ -76,3 +79,4 @@ The app saves the following to `imgfinder_config.json`:
 - All settings (appearance, performance, weights, layout)
 - **Tab names** (set via right-click rename)
 - **Per-tab B&W mode state** (each tab's B&W toggle setting is saved)
+- **Per-tab Shape mode state** (each tab's Shape toggle setting is saved)
